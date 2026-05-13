@@ -3,7 +3,7 @@ domain: user1.example.com
 
 image:
   repository: tenant-website
-  tag: v1
+  tag: v3
   pullPolicy: IfNotPresent
 
 replicaCount: 2
