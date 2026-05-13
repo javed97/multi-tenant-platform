@@ -1,0 +1,88 @@
+name: Build, Deploy, Rollback Demo
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: tenant-website
+  REGISTRY: ghcr.io
+
+jobs:
+  build-and-push:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: meta
+        run: echo "tag=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push
+        uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ github.repository }}/${{ env.IMAGE_NAME }}:latest
+
+  deploy:
+    name: Deploy to Cluster (simulated)
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Helm lint
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          helm lint ./helm-chart -f tenants/user1.values.yaml
+          helm lint ./helm-chart -f tenants/user2.values.yaml
+          helm lint ./helm-chart -f tenants/user3.values.yaml
+
+      - name: Render manifests
+        run: |
+          helm template user1 ./helm-chart -f tenants/user1.values.yaml \
+            --set image.tag=${{ needs.build-and-push.outputs.image_tag }} > /tmp/user1.yaml
+          echo "Rendered $(wc -l < /tmp/user1.yaml) lines of manifest for user1"
+
+      - name: Simulate deploy
+        run: |
+          echo "✅ Would run: helm upgrade --install user1 ./helm-chart -f tenants/user1.values.yaml --set image.tag=${{ needs.build-and-push.outputs.image_tag }}"
+          echo "✅ Would run the same for user2 and user3"
+
+  rollback-demo:
+    name: Rollback Demo (manual trigger)
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Simulate rollback
+        run: |
+          echo "✅ Rollback would run: helm rollback user1 --wait"
+          echo "Demonstrates one-command rollback capability"
+
+  publish-event:
+    name: Publish Deployment Event to Kafka
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Emit event (simulated)
+        run: |
+          echo "{\"event\":\"DeploymentSucceeded\",\"sha\":\"${{ github.sha }}\",\"image\":\"${{ needs.build-and-push.outputs.image_tag }}\",\"timestamp\":\"$(date -Iseconds)\"}"
+          echo "✅ In-cluster, this would publish to the website-events topic"

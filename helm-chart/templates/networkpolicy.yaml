@@ -1,0 +1,33 @@
+{{- if .Values.networkPolicy.enabled }}
+# Default-deny: nothing can talk to pods in this namespace unless explicitly allowed
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Values.tenant }}-default-deny
+  namespace: {{ .Values.tenant }}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+# Allow nginx-ingress to reach this tenant's pods
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Values.tenant }}-allow-ingress-nginx
+  namespace: {{ .Values.tenant }}
+spec:
+  podSelector:
+    matchLabels:
+      app: {{ .Values.tenant }}-web
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: {{ .Values.service.targetPort }}
+{{- end }}

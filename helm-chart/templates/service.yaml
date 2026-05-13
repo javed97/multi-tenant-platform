@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.tenant }}-web
+  namespace: {{ .Values.tenant }}
+  labels:
+    app: {{ .Values.tenant }}-web
+    tenant: {{ .Values.tenant }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app: {{ .Values.tenant }}-web
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.targetPort }}

@@ -1,0 +1,4 @@
+tenant: user1
+domain: user1.example.com
+image:
+  tag: v3

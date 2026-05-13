@@ -1,0 +1,61 @@
+tenant: user1
+domain: user1.example.com
+
+image:
+  repository: tenant-website
+  tag: v1
+  pullPolicy: IfNotPresent
+
+replicaCount: 2
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 3000
+
+env:
+  port: "3000"
+
+ingress:
+  enabled: true
+  className: nginx
+  clusterIssuer: selfsigned-issuer
+
+probes:
+  liveness:
+    path: /healthz
+    initialDelaySeconds: 10
+    periodSeconds: 10
+  readiness:
+    path: /readyz
+    initialDelaySeconds: 3
+    periodSeconds: 5
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+
+networkPolicy:
+  enabled: true
+
+resourceQuota:
+  enabled: true
+  requestsCpu: "1"
+  requestsMemory: "1Gi"
+  limitsCpu: "2"
+  limitsMemory: "2Gi"
+  pods: "10"
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 50
