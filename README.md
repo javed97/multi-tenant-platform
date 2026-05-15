@@ -1,26 +1,67 @@
-# Multi-Tenant Website Platform
+# Multi-Tenant Kubernetes Platform
 
-DevOps assignment. A small Kubernetes platform that hosts multiple tenant websites in isolated namespaces, with TLS ingress, autoscaling, network policies, Kafka events, Prometheus/Grafana, and a GitHub Actions pipeline.
+A Kubernetes platform that hosts multiple isolated tenant websites on shared infrastructure, with TLS ingress, autoscaling, network isolation, event streaming, observability, and a CI/CD pipeline. Each tenant lives in its own namespace, gets its own subdomain over HTTPS, and is fenced off from the others by default-deny NetworkPolicies and ResourceQuotas. New tenants are onboarded with a single `helm install`.
 
-Stack: kind (local cluster), Calico (network policies), Helm, ingress-nginx, cert-manager (self-signed), kube-prometheus-stack, Apache Kafka 3.7 (KRaft, single node), Node.js sample app.
+Built end-to-end as a portfolio project to demonstrate multi-tenancy, platform engineering, and event-driven thinking on Kubernetes. Runs locally on a `kind` cluster — every architectural decision is portable to a managed cluster (EKS/GKE/AKS); see [Production gap](#production-gap) for what changes.
 
-## Repo layout
+## Stack
+
+| Concern | Choice | Why |
+| --- | --- | --- |
+| Cluster | kind | Free, fast iteration loop; standard upstream Kubernetes |
+| CNI | Calico | Enforces NetworkPolicies (kind's default `kindnet` does not) |
+| Packaging | Helm | One templated chart per tenant; release history enables one-command rollback |
+| Ingress | ingress-nginx | Most widely deployed, well-documented controller |
+| TLS | cert-manager + self-signed `ClusterIssuer` | Local cluster can't satisfy Let's Encrypt's HTTP-01 challenge; swap issuer for prod |
+| Events | Apache Kafka 3.7 in KRaft mode | No ZooKeeper dependency; single-node sufficient for the demo |
+| Observability | kube-prometheus-stack | Prometheus + Grafana, pre-wired |
+| App | Node.js (Express + KafkaJS) | Minimal sample with a CPU-burn endpoint to drive HPA |
+| CI/CD | GitHub Actions, image push to GHCR | Zero extra infra; auto-authenticates with the repo |
+
+## What it does
+
+**Multi-tenant deployment.** Three tenants (`user1`, `user2`, `user3`) each live in their own namespace and reach the cluster at `https://userN.example.com`. Per-tenant resources: Deployment, Service, Ingress (with TLS), NetworkPolicy (default-deny + targeted allow rules), ResourceQuota, PodDisruptionBudget, and HPA. Adding a fourth tenant is one command:
+
+```bash
+helm install user4 ./helm-chart -f tenants/user4.values.yaml
+```
+
+No cluster restart, no template edits — `tenants/userN.values.yaml` is the only per-tenant file.
+
+**Tenant isolation.** Each namespace defaults to denying all ingress and egress; the chart's NetworkPolicy templates open the minimum needed (ingress from `ingress-nginx`, DNS, etc.). Calico enforces this at the dataplane — without it, `NetworkPolicy` objects would exist but be silently ignored.
+
+**Scaling under load.** Each tenant's HPA scales 2 → 6 replicas at 50% CPU target. The sample app exposes `/burn`, a deliberately CPU-heavy endpoint used to drive realistic spikes with `hey`. ResourceQuotas cap any single tenant at 1 CPU / 1Gi requests and 10 pods so a noisy tenant can't starve the others. PDBs (`minAvailable: 1`) keep each tenant up during voluntary disruptions like node drains.
+
+**Event-driven pipeline.** A single-node Kafka StatefulSet (KRaft) runs in-cluster. The sample app publishes a `WebsiteCreated` event to the `website-events` topic on startup. The CI/CD pipeline emits a `DeploymentSucceeded` event payload on every successful deploy.
+
+**CI/CD.** `.github/workflows/deploy.yml` runs on every push to `main`:
+1. Build and push the image to GHCR, tagged with the short commit SHA (immutable) and `latest` (moving).
+2. `helm lint` and `helm template` for every tenant — catches template/value errors before deploy.
+3. Deploy step (simulated locally — see [Production gap](#production-gap)).
+4. Rollback demo, runs only on manual `workflow_dispatch`.
+5. Emits a `DeploymentSucceeded` event.
+
+**Observability.** kube-prometheus-stack provides Prometheus scraping and Grafana dashboards out of the box; tenant pods are auto-discovered.
+
+## Repository layout
 
 ```
-app/                  Node.js sample app (Express + KafkaJS)
-helm-chart/           One chart, installed once per tenant
-tenants/              Per-tenant values files (user1..user4)
-kafka/                Single-node Kafka StatefulSet + Service
-kind-cluster.yaml     Cluster config (ports 80/443 mapped to host)
-calico-installation.yaml
-selfsigned-issuer.yaml
-.github/workflows/    CI/CD pipeline
-docs/screenshots/     Proof-of-work screenshots
+app/                       Node.js sample app + Dockerfile
+helm-chart/                One chart, installed once per tenant
+  templates/               Deployment, Service, Ingress, NetworkPolicy,
+                           ResourceQuota, PDB, HPA
+tenants/                   Per-tenant values files (user1..user4)
+kafka/kafka.yaml           Single-node KRaft Kafka + Service
+kind-cluster.yaml          Cluster config (host ports 80/443 mapped in)
+calico-installation.yaml   Calico CNI install spec
+selfsigned-issuer.yaml     cert-manager ClusterIssuer
+.github/workflows/         CI/CD pipeline
+docs/screenshots/          Proof-of-work screenshots for each capability
 ```
 
-## Quick start (local)
+## Quick start
 
-Prereqs: docker, kubectl, helm, kind, hey.
+Prereqs: `docker`, `kubectl`, `helm`, `kind`, `hey`.
 
 ```bash
 # 1. Cluster + CNI + ingress + cert-manager + monitoring
@@ -34,14 +75,14 @@ helm repo add prometheus-community https://prometheus-community.github.io/helm-c
 helm repo update
 
 helm install ingress-nginx ingress-nginx/ingress-nginx -n ingress-nginx --create-namespace
-helm install cert-manager jetstack/cert-manager -n cert-manager --create-namespace --set installCRDs=true
+helm install cert-manager  jetstack/cert-manager       -n cert-manager   --create-namespace --set installCRDs=true
 kubectl apply -f selfsigned-issuer.yaml
-helm install monitoring prometheus-community/kube-prometheus-stack -n monitoring --create-namespace
+helm install monitoring    prometheus-community/kube-prometheus-stack -n monitoring --create-namespace
 
 # 2. Kafka
 kubectl apply -f kafka/kafka.yaml
 
-# 3. App image
+# 3. App image (build locally, then load into kind)
 docker build -t tenant-website:v3 ./app
 kind load docker-image tenant-website:v3 --name platform
 
@@ -50,46 +91,16 @@ for u in user1 user2 user3; do
   helm install $u ./helm-chart -f tenants/$u.values.yaml
 done
 
-# 5. Local DNS
+# 5. Local DNS (the only piece that doesn't generalize — see Production gap)
 sudo sh -c 'echo "127.0.0.1 user1.example.com user2.example.com user3.example.com" >> /etc/hosts'
 
 # 6. Verify
-for u in user1 user2 user3; do curl -sk -o /dev/null -w "$u %{http_code}\n" https://$u.example.com; done
+for u in user1 user2 user3; do
+  curl -sk -o /dev/null -w "$u %{http_code}\n" https://$u.example.com
+done
 ```
 
-## Deliverables map
-
-All screenshots are in `docs/screenshots/`.
-
-### 1. Multi-tenant deployment & dynamic domain mapping
-- 3 tenants in their own namespaces, each gets deployment, service, ingress, NetworkPolicy, ResourceQuota, PDB, HPA.
-- TLS via cert-manager `selfsigned-issuer` (production would swap in Let's Encrypt).
-- Dynamic onboarding: a new tenant is just `helm install user4 ./helm-chart -f tenants/user4.values.yaml`. No cluster restart.
-
-Proof: `01-tenants-overview.png`, `02-all-user-resources.png`, `05-ingress-installed.png`, `06-ingress-certs.png`, `07-https-tenants.png`, `08-dynamic-onboarding.png`.
-
-### 2. CI/CD pipeline
-GitHub Actions workflow in `.github/workflows/deploy.yml`:
-1. Build & push image to GHCR
-2. Helm lint + render manifests for each tenant
-3. Simulated deploy step
-4. Rollback job (manual trigger only)
-5. Publishes a `DeploymentSucceeded` event to Kafka
-
-Proof: `17-ci-cd-pipeline.png` (successful run), `04-rollback.png` (helm rollback output).
-
-### 3. Scaling & observability
-- HPA per tenant: 2 to 6 replicas, target 50% CPU.
-- ResourceQuota per namespace: 1 CPU / 1Gi requests, 2 CPU / 2Gi limits, 10 pods max.
-- PodDisruptionBudget: `minAvailable: 1`.
-- Load generated with `hey` against `/burn` (a CPU-burn endpoint on the app).
-
-Proof: `10-probes-resources.png`, `11-pdb-and-netpol.png`, `12-hpa-baseline.png`, `13-hpa-scaling-up.png`, `14-hpa-scaling-down.png`, `15-grafana-dashboard.png`.
-
-### 4. Kafka event-driven pipeline
-- Single-node Kafka (KRaft mode) running in-cluster via `kafka/kafka.yaml`.
-- App publishes a `WebsiteCreated` event on startup (see `app/server.js`).
-- Consume:
+Consume the Kafka topic:
 
 ```bash
 kubectl exec -n kafka kafka-0 -- /opt/kafka/bin/kafka-console-consumer.sh \
@@ -98,24 +109,46 @@ kubectl exec -n kafka kafka-0 -- /opt/kafka/bin/kafka-console-consumer.sh \
   --max-messages 20 --timeout-ms 10000
 ```
 
-Proof: `16-kafka-events.png`.
-
-## Notes / trade-offs
-
-- **NetworkPolicy + Kafka.** The default-deny policy blocks egress to the Kafka namespace. For the Kafka demo this was temporarily relaxed on user1 by deleting `user1-default-deny`, then restored via `helm upgrade`. Production fix: add an explicit egress rule allowing `kafka.kafka:9092` to the chart's NetworkPolicy template.
-- **TLS.** Used cert-manager's self-signed ClusterIssuer because the cluster is local. Swap `clusterIssuer: selfsigned-issuer` to `letsencrypt-prod` for real domains.
-- **Kafka.** Single node, no replication. Sufficient for the demo; in production it would be a 3-broker StatefulSet with PVCs and proper `min.insync.replicas`.
-- **CI/CD deploy step is simulated.** The workflow lints and renders manifests but doesn't push to the local kind cluster (no inbound network from GitHub). Wiring it to a real cluster is a kubeconfig secret + one `helm upgrade` line.
-
-## Rollback
+Roll back a tenant:
 
 ```bash
 helm history user1
 helm rollback user1 <revision>
 ```
 
-## Tear down
+Tear down everything:
 
 ```bash
 kind delete cluster --name platform
 ```
+
+## Production gap
+
+Honest list of what's local-only and the one-line fix for each. Every other architectural decision in this repo is production-shaped.
+
+| Local choice | Production swap |
+| --- | --- |
+| `kind` cluster on laptop | Managed Kubernetes (EKS / GKE / AKS), provisioned via Terraform |
+| `selfsigned-issuer` ClusterIssuer | `letsencrypt-prod` ClusterIssuer — one value change in the chart |
+| `/etc/hosts` entries for `userN.example.com` | Real domain with DNS records pointing at the ingress LB |
+| `kind load docker-image` | Already publishing to GHCR; pull from there |
+| Single-broker Kafka, no replication | 3-broker StatefulSet with PVCs, `replication.factor=3`, `min.insync.replicas=2` |
+| CI/CD deploy step is simulated | Add a kubeconfig secret + one `helm upgrade --install` line — pipeline structure is already correct |
+
+## Trade-offs and known issues
+
+- **NetworkPolicy + Kafka.** The default-deny policy on each tenant blocks egress to the `kafka` namespace. For the demo, this was temporarily relaxed on `user1` by deleting the `user1-default-deny` policy, then restored. The clean fix is an explicit egress rule in the chart's NetworkPolicy template allowing `kafka.kafka:9092`.
+- **Self-signed TLS.** `curl -sk` and browser warnings are expected locally; see [Production gap](#production-gap).
+- **CI/CD deploy is simulated.** GitHub-hosted runners can't reach a kind cluster on a laptop behind a home router. The pipeline lints, renders, and pushes a real image; the final `helm upgrade` is described but not executed. See [Production gap](#production-gap).
+
+## Screenshots
+
+All proof-of-work is under `docs/screenshots/`:
+
+- Multi-tenant deployment and dynamic onboarding: `01`, `02`, `05`, `06`, `07`, `08`
+- Rollback: `04`
+- Resources, probes, PDB, NetworkPolicy: `10`, `11`
+- HPA baseline, scale-up, scale-down: `12`, `13`, `14`
+- Grafana dashboard: `15`
+- Kafka events consumed: `16`
+- CI/CD pipeline (green run): `17`
